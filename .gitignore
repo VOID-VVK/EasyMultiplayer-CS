@@ -1,0 +1,19 @@
+# Godot
+.godot/
+*.import
+export.cfg
+export_presets.cfg
+
+# Mono/C#
+.mono/
+data_*/
+mono_crash.*.json
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
