@@ -1,5 +1,6 @@
 using Godot;
 using System;
+using System.Collections.Generic;
 
 namespace EasyMultiplayer.Transport;
 
@@ -8,8 +9,8 @@ namespace EasyMultiplayer.Transport;
 /// </summary>
 /// <remarks>
 /// <para>
-/// 封装 Godot 的 <see cref="ENetMultiplayerPeer"/>，将 Godot Multiplayer 回调
-/// 映射到 <see cref="ITransport"/> 事件，使上层代码与 Godot 具体实现解耦。
+/// 封装 Godot 的 <see cref="ENetMultiplayerPeer"/>，不设置 MultiplayerPeer 到 MultiplayerAPI，
+/// 通过握手包和数据包 senderId 驱动 peer 发现。
 /// </para>
 /// <para>
 /// 使用者需在每帧调用 <see cref="Poll"/> 以驱动事件循环（通常由 EasyMultiplayer 单例的 _Process 调用）。
@@ -18,13 +19,20 @@ namespace EasyMultiplayer.Transport;
 public class ENetTransport : ITransport
 {
     private ENetMultiplayerPeer? _peer;
-    private SceneTree? _sceneTree;
 
     /// <summary>记住上次连接的地址，用于重连。</summary>
     private string _lastAddress = "";
 
     /// <summary>记住上次连接的端口，用于重连。</summary>
     private int _lastPort;
+
+    private readonly HashSet<int> _knownPeers = new();
+
+    /// <summary>内部握手通道标识，服务器收到后触发 PeerConnected，不传递给上层。</summary>
+    private const int HandshakeChannel = int.MinValue;
+
+    /// <summary>客户端上一帧的 ENet 连接状态，用于检测状态转换。</summary>
+    private MultiplayerPeer.ConnectionStatus _prevClientStatus = MultiplayerPeer.ConnectionStatus.Disconnected;
 
     // ── ITransport 事件 ──
 
@@ -55,35 +63,19 @@ public class ENetTransport : ITransport
     public TransportStatus Status { get; private set; } = TransportStatus.Disconnected;
 
     /// <summary>
-    /// 初始化传输层，绑定 Godot SceneTree 的 Multiplayer 回调。
+    /// 保留接口兼容性，内部不使用 SceneTree（不设置 MultiplayerPeer 到 MultiplayerAPI）。
     /// </summary>
-    /// <param name="sceneTree">当前场景树，用于访问 <see cref="SceneTree.Root"/> 的 Multiplayer。</param>
     public void Initialize(SceneTree sceneTree)
     {
-        _sceneTree = sceneTree;
-        var mp = GetMultiplayer();
-        if (mp == null) return;
-
-        mp.PeerConnected += OnPeerConnected;
-        mp.PeerDisconnected += OnPeerDisconnected;
-        mp.ConnectedToServer += OnConnectedToServer;
-        mp.ConnectionFailed += OnConnectionFailed;
-        mp.ServerDisconnected += OnServerDisconnected;
+        // 不设置 MultiplayerPeer 到 MultiplayerAPI，使用信号 + 握手包发现机制
     }
 
     /// <summary>
-    /// 清理回调绑定。应在不再使用此传输层时调用。
+    /// 清理资源。
     /// </summary>
     public void Cleanup()
     {
-        var mp = GetMultiplayer();
-        if (mp == null) return;
-
-        mp.PeerConnected -= OnPeerConnected;
-        mp.PeerDisconnected -= OnPeerDisconnected;
-        mp.ConnectedToServer -= OnConnectedToServer;
-        mp.ConnectionFailed -= OnConnectionFailed;
-        mp.ServerDisconnected -= OnServerDisconnected;
+        _knownPeers.Clear();
     }
 
     // ── ITransport 生命周期 ──
@@ -104,12 +96,6 @@ public class ENetTransport : ITransport
             GD.PrintErr($"[ENetTransport] 创建主机失败: {error}");
             _peer = null;
             return error;
-        }
-
-        var mp = GetMultiplayer();
-        if (mp != null)
-        {
-            mp.MultiplayerPeer = _peer;
         }
 
         _lastPort = port;
@@ -138,16 +124,11 @@ public class ENetTransport : ITransport
             return error;
         }
 
-        var mp = GetMultiplayer();
-        if (mp != null)
-        {
-            mp.MultiplayerPeer = _peer;
-        }
-
         _lastAddress = address;
         _lastPort = port;
         IsServer = false;
         Status = TransportStatus.Connecting;
+        _prevClientStatus = MultiplayerPeer.ConnectionStatus.Connecting;
         GD.Print($"[ENetTransport] 正在连接 {address}:{port}");
         return Error.Ok;
     }
@@ -158,16 +139,12 @@ public class ENetTransport : ITransport
         if (_peer == null) return;
 
         _peer.Close();
-        var mp = GetMultiplayer();
-        if (mp != null)
-        {
-            mp.MultiplayerPeer = null;
-        }
-
         _peer = null;
+        _knownPeers.Clear();
         IsServer = false;
         UniqueId = 0;
         Status = TransportStatus.Disconnected;
+        _prevClientStatus = MultiplayerPeer.ConnectionStatus.Disconnected;
         GD.Print("[ENetTransport] 已断开连接");
     }
 
@@ -179,21 +156,125 @@ public class ENetTransport : ITransport
         GD.Print($"[ENetTransport] 已断开对端: {peerId}");
     }
 
+    // ── ENet 信号处理 ──
+
+    private void OnENetPeerConnected(long id)
+    {
+        var peerId = (int)id;
+        _knownPeers.Add(peerId);
+        GD.Print($"[ENetTransport] 对端已连接 (信号): {peerId}");
+        // 服务器端：立即通知上层（客户端连接由 ConnectionSucceeded 通知）
+        if (IsServer)
+            PeerConnected?.Invoke(peerId);
+    }
+
+    private void OnENetPeerDisconnected(long id)
+    {
+        var peerId = (int)id;
+        _knownPeers.Remove(peerId);
+        GD.Print($"[ENetTransport] 对端已断开 (信号): {peerId}");
+        if (IsServer)
+            PeerDisconnected?.Invoke(peerId);
+    }
+
     /// <inheritdoc />
     public void Poll()
     {
-        // 从 ENetMultiplayerPeer 读取所有可用数据包并触发 DataReceived 事件
         if (_peer == null || Status == TransportStatus.Disconnected) return;
 
-        while (_peer.GetAvailablePacketCount() > 0)
-        {
-            var rawPacket = _peer.GetPacket();
-            var senderId = _peer.GetPacketPeer();
+        _peer.Poll();
 
-            if (rawPacket != null && rawPacket.Length >= 4)
+        // 客户端：通过轮询 ENet 连接状态检测连接成功/失败
+        if (!IsServer)
+        {
+            var currentStatus = _peer.GetConnectionStatus();
+
+            if (_prevClientStatus != currentStatus)
             {
-                var (channel, data) = ParsePacket(rawPacket);
-                DataReceived?.Invoke((int)senderId, channel, data);
+                if (_prevClientStatus == MultiplayerPeer.ConnectionStatus.Connecting &&
+                    currentStatus == MultiplayerPeer.ConnectionStatus.Connected)
+                {
+                    _prevClientStatus = currentStatus;
+                    UniqueId = _peer.GetUniqueId();
+                    Status = TransportStatus.Connected;
+                    _knownPeers.Add(1); // 服务器 peer ID = 1（信号可能已添加，HashSet 幂等）
+                    GD.Print($"[ENetTransport] 已连接到服务器, UniqueId={UniqueId}");
+                    // 发送握手包，让服务器发现此客户端
+                    SendReliable(1, HandshakeChannel, new byte[] { 0x01 });
+                    ConnectionSucceeded?.Invoke();
+                }
+                else if (currentStatus == MultiplayerPeer.ConnectionStatus.Disconnected)
+                {
+                    _prevClientStatus = currentStatus;
+                    if (Status == TransportStatus.Connecting)
+                    {
+                        GD.PrintErr("[ENetTransport] 连接服务器失败");
+                        _peer = null;
+                        Status = TransportStatus.Disconnected;
+                        ConnectionFailed?.Invoke();
+                        return;
+                    }
+                    else
+                    {
+                        GD.Print("[ENetTransport] 与服务器的连接已断开");
+                        Status = TransportStatus.Disconnected;
+                        PeerDisconnected?.Invoke(1); // 服务器 peer ID = 1
+                        return;
+                    }
+                }
+                else
+                {
+                    _prevClientStatus = currentStatus;
+                }
+            }
+        }
+
+        // 读取并消费所有数据包，防止 Godot RPC 系统处理自定义包
+        while (_peer != null && _peer.GetAvailablePacketCount() > 0)
+        {
+            var senderId = (int)_peer.GetPacketPeer();
+            var rawPacket = _peer.GetPacket();
+
+            if (rawPacket == null || rawPacket.Length < 4) continue;
+
+            var (channel, data) = ParsePacket(rawPacket);
+
+            if (channel == HandshakeChannel)
+            {
+                // 握手包兜底：若信号未触发，服务器通过此包发现新客户端
+                if (IsServer && !_knownPeers.Contains(senderId))
+                {
+                    _knownPeers.Add(senderId);
+                    GD.Print($"[ENetTransport] 对端已连接 (握手兜底): {senderId}");
+                    PeerConnected?.Invoke(senderId);
+                }
+                // 握手包不传递给上层
+            }
+            else
+            {
+                // 普通数据包：若服务器收到未知 peer 的包，也触发 PeerConnected（兜底）
+                if (IsServer && !_knownPeers.Contains(senderId))
+                {
+                    _knownPeers.Add(senderId);
+                    GD.Print($"[ENetTransport] 对端已连接 (首包兜底): {senderId}");
+                    PeerConnected?.Invoke(senderId);
+                }
+                DataReceived?.Invoke(senderId, channel, data);
+            }
+        }
+
+        // 服务器端：检测整体连接断开（安全兜底）
+        if (IsServer && _peer != null)
+        {
+            var serverStatus = _peer.GetConnectionStatus();
+            if (serverStatus == MultiplayerPeer.ConnectionStatus.Disconnected)
+            {
+                GD.Print("[ENetTransport] 服务器连接已断开，通知所有已知对端");
+                var snapshot = new List<int>(_knownPeers);
+                _knownPeers.Clear();
+                Status = TransportStatus.Disconnected;
+                foreach (var pid in snapshot)
+                    PeerDisconnected?.Invoke(pid);
             }
         }
     }
@@ -203,10 +284,8 @@ public class ENetTransport : ITransport
     /// <inheritdoc />
     public void SendReliable(int peerId, int channel, byte[] data)
     {
-        if (_peer == null || Status == TransportStatus.Disconnected) return;
-
+        if (_peer == null || Status != TransportStatus.Connected) return;
         _peer.TransferMode = MultiplayerPeer.TransferModeEnum.Reliable;
-
         var packet = BuildPacket(channel, data);
         SendPacket(peerId, packet);
     }
@@ -214,51 +293,23 @@ public class ENetTransport : ITransport
     /// <inheritdoc />
     public void SendUnreliable(int peerId, int channel, byte[] data)
     {
-        if (_peer == null || Status == TransportStatus.Disconnected) return;
-
+        if (_peer == null || Status != TransportStatus.Connected) return;
         _peer.TransferMode = MultiplayerPeer.TransferModeEnum.Unreliable;
-
         var packet = BuildPacket(channel, data);
         SendPacket(peerId, packet);
     }
 
-    /// <summary>
-    /// 通过 ENetMultiplayerPeer 发送数据包。
-    /// 使用 <see cref="ENetMultiplayerPeer.GetPeer"/> 获取 ENetPacketPeer 直接发送。
-    /// </summary>
     private void SendPacket(int peerId, byte[] packet)
     {
         if (_peer == null) return;
-
-        if (peerId == 0)
-        {
-            // 广播：设置 target peer 为 0，通过 PutPacket 发送
-            _peer.SetTargetPeer(0);
-            _peer.PutPacket(packet);
-        }
-        else
-        {
-            _peer.SetTargetPeer(peerId);
-            _peer.PutPacket(packet);
-        }
+        _peer.SetTargetPeer(peerId);
+        var err = _peer.PutPacket(packet);
+        if (err != Error.Ok)
+            GD.PrintErr($"[ENetTransport] PutPacket 失败 (peer={peerId}): {err}");
     }
 
     // ── 辅助方法 ──
 
-    /// <summary>
-    /// 获取当前 SceneTree 的 Multiplayer API。
-    /// </summary>
-    private MultiplayerApi? GetMultiplayer()
-    {
-        return _sceneTree?.Root?.Multiplayer;
-    }
-
-    /// <summary>
-    /// 构建数据包：在数据前附加通道编号（4 字节 int），便于接收端解析。
-    /// </summary>
-    /// <param name="channel">逻辑通道编号。</param>
-    /// <param name="data">原始数据载荷。</param>
-    /// <returns>带通道头的完整数据包。</returns>
     private static byte[] BuildPacket(int channel, byte[] data)
     {
         var packet = new byte[4 + data.Length];
@@ -267,81 +318,19 @@ public class ENetTransport : ITransport
         return packet;
     }
 
-    /// <summary>
-    /// 解析数据包，提取通道编号和原始数据。
-    /// </summary>
-    /// <param name="packet">带通道头的完整数据包。</param>
-    /// <returns>通道编号和原始数据载荷。</returns>
     private static (int channel, byte[] data) ParsePacket(byte[] packet)
     {
         if (packet.Length < 4)
             return (0, packet);
-
         var channel = BitConverter.ToInt32(packet, 0);
         var data = new byte[packet.Length - 4];
         Array.Copy(packet, 4, data, 0, data.Length);
         return (channel, data);
     }
 
-    /// <summary>
-    /// 获取上次连接的地址（用于重连）。
-    /// </summary>
+    /// <summary>获取上次连接的地址（用于重连）。</summary>
     public string LastAddress => _lastAddress;
 
-    /// <summary>
-    /// 获取上次连接的端口（用于重连）。
-    /// </summary>
+    /// <summary>获取上次连接的端口（用于重连）。</summary>
     public int LastPort => _lastPort;
-
-    // ── Godot Multiplayer 回调 ──
-
-    private void OnPeerConnected(long peerId)
-    {
-        GD.Print($"[ENetTransport] 对端已连接: {peerId}");
-        PeerConnected?.Invoke((int)peerId);
-    }
-
-    private void OnPeerDisconnected(long peerId)
-    {
-        GD.Print($"[ENetTransport] 对端已断开: {peerId}");
-        PeerDisconnected?.Invoke((int)peerId);
-    }
-
-    private void OnConnectedToServer()
-    {
-        var mp = GetMultiplayer();
-        if (mp != null)
-        {
-            UniqueId = mp.GetUniqueId();
-        }
-        Status = TransportStatus.Connected;
-        GD.Print($"[ENetTransport] 已连接到服务器, UniqueId={UniqueId}");
-        ConnectionSucceeded?.Invoke();
-    }
-
-    private void OnConnectionFailed()
-    {
-        GD.PrintErr("[ENetTransport] 连接服务器失败");
-        Status = TransportStatus.Disconnected;
-        _peer = null;
-        var mp = GetMultiplayer();
-        if (mp != null)
-        {
-            mp.MultiplayerPeer = null;
-        }
-        ConnectionFailed?.Invoke();
-    }
-
-    private void OnServerDisconnected()
-    {
-        GD.Print("[ENetTransport] 服务器已断开");
-        _peer?.Close();
-        _peer = null;
-        var mp = GetMultiplayer();
-        if (mp != null) mp.MultiplayerPeer = null;
-        IsServer = false;
-        UniqueId = 0;
-        Status = TransportStatus.Disconnected;
-        PeerDisconnected?.Invoke(1); // Server peer ID is always 1
-    }
 }

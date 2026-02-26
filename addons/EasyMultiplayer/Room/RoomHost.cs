@@ -1,5 +1,4 @@
 using Godot;
-using System;
 using System.Collections.Generic;
 using System.Text;
 using EasyMultiplayer.Core;
@@ -17,9 +16,9 @@ namespace EasyMultiplayer.Room;
 /// 房间状态机：Idle → Waiting → Ready → Playing → Closed。
 /// </para>
 /// <para>
-/// 此实现不依赖 EventBus，所有事件通过 Godot Signal 暴露。
-/// 准备状态通过 MessageChannel 传输，而非 Godot RPC，
-/// 保持与 ITransport 抽象的一致性。
+/// 与千棋世界的 RoomHost 不同，此实现不依赖 EventBus，
+/// 所有事件通过 Godot Signal 暴露。准备状态通过 MessageChannel 传输，
+/// 而非 Godot RPC，保持与 ITransport 抽象的一致性。
 /// </para>
 /// </remarks>
 public partial class RoomHost : Node
@@ -201,6 +200,16 @@ public partial class RoomHost : Node
         State = RoomState.Waiting;
         GD.Print($"[RoomHost] 房间已创建: {name} ({gameType}) 端口:{Port} 最大玩家:{MaxPlayers}");
         return Error.Ok;
+    }
+
+    /// <summary>
+    /// 仅停止广播，不断开已连接的客人。
+    /// 用于对手加入后停止广播，同时保持连接。
+    /// </summary>
+    public void StopBroadcast()
+    {
+        _discovery?.StopBroadcast();
+        GD.Print("[RoomHost] 广播已停止（连接保持）");
     }
 
     /// <summary>

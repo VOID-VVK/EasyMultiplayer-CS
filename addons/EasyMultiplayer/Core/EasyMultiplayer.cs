@@ -131,8 +131,8 @@ public partial class EasyMultiplayer : Node
     /// <summary>本机唯一标识符。</summary>
     public int UniqueId => _transport.UniqueId;
 
-    /// <summary>是否已连接（网络层）。</summary>
-    public bool IsNetworkConnected => _state == ConnectionState.Connected;
+    /// <summary>是否已连接（网络层）。Host 端处于 Hosting 状态也视为已连接。</summary>
+    public bool IsNetworkConnected => _state == ConnectionState.Connected || _state == ConnectionState.Hosting;
 
     /// <summary>是否正在重连。</summary>
     public bool IsReconnecting => _state == ConnectionState.Reconnecting;
@@ -193,6 +193,8 @@ public partial class EasyMultiplayer : Node
         _discovery = new UdpBroadcastDiscovery();
         _discovery.SetConfig(Config);
         AddChild(_discovery);
+        // 提前在后台线程预加载本机 IP，避免 StartListening 首次调用时阻塞主线程
+        _discovery.PreloadLocalIps();
 
         // 创建心跳管理器
         _heartbeat = new HeartbeatManager();
@@ -229,6 +231,14 @@ public partial class EasyMultiplayer : Node
 
         // 绑定消息通道事件（处理版本校验和主动退出）
         _messageChannel.MessageReceived += OnInternalMessageReceived;
+
+        // 绑定房间模块状态事件，同步 EasyMultiplayer 连接状态
+        _roomHost.RoomStateChanged += OnRoomHostStateChanged;
+        _roomClient.ClientStateChanged += OnRoomClientStateChanged;
+
+        // 确保 EasyMultiplayer 的 _Process 在 SceneMultiplayer 之前执行，
+        // 先消费所有数据包，防止 SceneMultiplayer 抢先消费导致 Poll() 收不到数据。
+        ProcessPriority = int.MinValue;
 
         GD.Print("[EasyMultiplayer] 初始化完成");
     }
@@ -287,6 +297,9 @@ public partial class EasyMultiplayer : Node
         _heartbeat.FullSyncRequested -= OnHeartbeatFullSyncRequested;
 
         _messageChannel.MessageReceived -= OnInternalMessageReceived;
+
+        _roomHost.RoomStateChanged -= OnRoomHostStateChanged;
+        _roomClient.ClientStateChanged -= OnRoomClientStateChanged;
 
         _transport.Cleanup();
     }
@@ -511,6 +524,7 @@ public partial class EasyMultiplayer : Node
     private void OnTransportPeerConnected(int peerId)
     {
         _connectedPeers.Add(peerId);
+        GD.Print($"[EasyMultiplayer] OnTransportPeerConnected: peerId={peerId}, _connectedPeers.Count={_connectedPeers.Count}");
 
         // 如果在重连状态，由心跳管理器处理
         if (_state == ConnectionState.Reconnecting) return;
@@ -573,13 +587,15 @@ public partial class EasyMultiplayer : Node
     /// </summary>
     private void OnTransportConnectionSucceeded()
     {
+        GD.Print($"[EasyMultiplayer] OnTransportConnectionSucceeded: State={_state}");
         if (_state == ConnectionState.Reconnecting) return; // 由心跳管理器处理
 
         if (_state == ConnectionState.Joining)
         {
             _joiningTimer = 0;
             State = ConnectionState.Connected;
-            _heartbeat.TrackPeer(1); // Server peer ID = 1
+            _connectedPeers.Add(1); // Server peer ID = 1
+            _heartbeat.TrackPeer(1);
             _heartbeat.Start();
 
             EmitSignal(SignalName.ConnectionSucceeded);
@@ -708,6 +724,50 @@ public partial class EasyMultiplayer : Node
             GD.Print($"[EasyMultiplayer] 收到对端 {peerId} 主动退出通知: reason={reason}");
             _gracefullyQuitPeers.Add(peerId);
             EmitSignal(SignalName.PeerGracefulQuit, peerId, reason);
+        }
+    }
+
+    // ── 房间模块状态同步 ──
+
+    /// <summary>
+    /// 同步 RoomHost 状态到 EasyMultiplayer 连接状态。
+    /// </summary>
+    private void OnRoomHostStateChanged(int oldState, int newState)
+    {
+        // RoomState.Waiting = 1：房间已创建并等待玩家，同步为 Hosting
+        if (newState == (int)RoomState.Waiting && _state == ConnectionState.Disconnected)
+        {
+            State = ConnectionState.Hosting;
+        }
+        // RoomState.Closed = 4：房间已关闭，同步为 Disconnected
+        else if (newState == (int)RoomState.Closed && _state != ConnectionState.Disconnected)
+        {
+            State = ConnectionState.Disconnected;
+        }
+    }
+
+    /// <summary>
+    /// 同步 RoomClient 状态到 EasyMultiplayer 连接状态。
+    /// </summary>
+    private void OnRoomClientStateChanged(int oldState, int newState)
+    {
+        // ClientState.Joining = 2：正在加入房间，同步为 Joining
+        if (newState == (int)ClientState.Joining && _state == ConnectionState.Disconnected)
+        {
+            State = ConnectionState.Joining;
+            _joiningTimer = 0;
+        }
+        // ClientState.Idle = 0：回到空闲（加入失败），仅当 RoomClient 是从 Joining 状态退回时才重置。
+        // 注意：Searching → Idle（StopSearching）不应影响 EasyMP 的 Joining 状态。
+        else if (newState == (int)ClientState.Idle && oldState == (int)ClientState.Joining
+                 && _state == ConnectionState.Joining)
+        {
+            GD.Print($"[EasyMultiplayer] OnRoomClientStateChanged: RoomClient Joining→Idle，重置为 Disconnected");
+            State = ConnectionState.Disconnected;
+        }
+        else
+        {
+            GD.Print($"[EasyMultiplayer] OnRoomClientStateChanged: {(ClientState)oldState} → {(ClientState)newState}，EasyMP.State={_state}（无操作）");
         }
     }
 }

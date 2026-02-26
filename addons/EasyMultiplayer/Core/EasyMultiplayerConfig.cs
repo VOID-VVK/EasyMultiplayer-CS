@@ -41,6 +41,14 @@ public partial class EasyMultiplayerConfig : Resource
     /// <summary>消息通道每通道最小发送间隔（毫秒），0 表示不限制。</summary>
     [Export] public double RpcMinIntervalMs { get; set; } = 100.0;
 
+    // ── 兜底检查 ──
+
+    /// <summary>兜底连接检查间隔（秒）。GameSession 和 NetworkLobby 使用此值定期检查连接状态。</summary>
+    [Export] public float FallbackCheckInterval { get; set; } = 10.0f;
+
+    /// <summary>进入场景后的兜底检查宽限期（秒）。在此期间不执行兜底检查，避免场景切换期间误触发。</summary>
+    [Export] public float FallbackGracePeriod { get; set; } = 5.0f;
+
     // ── 发现 ──
 
     /// <summary>UDP 广播端口。</summary>

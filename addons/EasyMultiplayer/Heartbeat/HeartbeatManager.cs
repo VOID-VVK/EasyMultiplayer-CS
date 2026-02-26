@@ -251,7 +251,7 @@ public partial class HeartbeatManager : Node
     /// </summary>
     private void SendPing()
     {
-        if (_transport == null) return;
+        if (_transport == null || _transport.Status != TransportStatus.Connected) return;
 
         _lastPingSentMs = Time.GetUnixTimeFromSystem() * 1000.0;
 

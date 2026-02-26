@@ -22,7 +22,7 @@ namespace EasyMultiplayer.Discovery;
 /// 使用 <see cref="Node.CallDeferred"/> 将异步接收回调切回主线程，确保线程安全。
 /// </para>
 /// <para>
-/// Magic 标识为 <c>EASYMULTI_V1</c>，用于过滤非本插件的广播包。
+/// Magic 标识为 <c>EASYMULTI_V1</c>，与千棋世界的 <c>QIANQI_V1</c> 区分，避免广播冲突。
 /// </para>
 /// </remarks>
 public partial class UdpBroadcastDiscovery : Node, IDiscovery
@@ -31,6 +31,9 @@ public partial class UdpBroadcastDiscovery : Node, IDiscovery
     /// 配置引用，广播端口、间隔、超时等参数从此读取。
     /// </summary>
     private EasyMultiplayerConfig _config = new();
+
+    /// <summary>本实例唯一标识，用于过滤自身广播。</summary>
+    private readonly string _instanceId = Guid.NewGuid().ToString("N")[..8];
 
     // ── 广播端（Host） ──
 
@@ -86,6 +89,7 @@ public partial class UdpBroadcastDiscovery : Node, IDiscovery
         _broadcastInfo = info;
         // 确保 Magic 正确
         _broadcastInfo.Magic = "EASYMULTI_V1";
+        _broadcastInfo.InstanceId = _instanceId;
 
         try
         {
@@ -277,28 +281,55 @@ public partial class UdpBroadcastDiscovery : Node, IDiscovery
     /// 本机 IP 地址集合，用于过滤自身广播。
     /// </summary>
     private readonly HashSet<string> _localIps = new();
+    private bool _localIpsCollected = false;
+    private readonly object _localIpsLock = new();
 
     /// <summary>
-    /// 收集本机所有 IP 地址。
+    /// 在后台线程预加载本机 IP，避免 StartListening 首次调用时阻塞主线程。
     /// </summary>
-    private void CollectLocalIps()
+    public void PreloadLocalIps()
     {
-        _localIps.Clear();
-        _localIps.Add("127.0.0.1");
-        _localIps.Add("::1");
+        if (_localIpsCollected) return;
+        System.Threading.Tasks.Task.Run(CollectLocalIpsInternal);
+    }
+
+    /// <summary>
+    /// 收集本机所有 IP 地址（线程安全，可从任意线程调用）。
+    /// </summary>
+    private void CollectLocalIpsInternal()
+    {
+        if (_localIpsCollected) return;
+        var ips = new HashSet<string> { "127.0.0.1", "::1" };
         try
         {
-            var hostName = Dns.GetHostName();
-            var addresses = Dns.GetHostAddresses(hostName);
-            foreach (var addr in addresses)
+            // 优先通过网络接口获取 IP，避免 DNS 解析主机名失败
+            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
             {
-                _localIps.Add(addr.ToString());
+                if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    ips.Add(ua.Address.ToString());
             }
         }
         catch (Exception ex)
         {
             GD.PrintErr($"[UdpBroadcastDiscovery] 获取本机 IP 失败: {ex.Message}");
         }
+        lock (_localIpsLock)
+        {
+            if (_localIpsCollected) return;
+            _localIps.Clear();
+            foreach (var ip in ips) _localIps.Add(ip);
+            _localIpsCollected = true;
+        }
+    }
+
+    /// <summary>
+    /// 收集本机所有 IP 地址（主线程兜底调用）。
+    /// </summary>
+    private void CollectLocalIps()
+    {
+        if (_localIpsCollected) return;
+        CollectLocalIpsInternal();
     }
 
     /// <summary>
@@ -308,9 +339,6 @@ public partial class UdpBroadcastDiscovery : Node, IDiscovery
     /// <param name="json">房间信息 JSON 字符串。</param>
     private void HandleRoomFound(string ip, string json)
     {
-        // 过滤自身广播
-        if (_localIps.Contains(ip)) return;
-
         RoomInfo? info;
         try
         {
@@ -323,6 +351,9 @@ public partial class UdpBroadcastDiscovery : Node, IDiscovery
         }
 
         if (info == null || info.Magic != "EASYMULTI_V1") return;
+
+        // 过滤自身广播（用实例 ID 而非 IP，支持同机多实例测试）
+        if (info.InstanceId == _instanceId) return;
 
         var key = $"{ip}:{info.Port}";
         var isNew = !_discoveredRooms.ContainsKey(key);

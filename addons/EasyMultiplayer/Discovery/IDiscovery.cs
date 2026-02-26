@@ -7,9 +7,9 @@ namespace EasyMultiplayer.Discovery;
 /// 房间信息数据类，作为广播载荷在网络中传输。
 /// </summary>
 /// <remarks>
-/// 新增 <see cref="Metadata"/> 字典，
+/// 相比千棋世界的实现，新增 <see cref="Metadata"/> 字典，
 /// 使用者可存放自定义数据（如游戏模式、地图名）而无需修改插件。
-/// Magic 标识为 <c>EASYMULTI_V1</c>，用于过滤非本插件的广播包。
+/// Magic 改为 <c>EASYMULTI_V1</c>，避免与千棋世界广播冲突。
 /// </remarks>
 public class RoomInfo
 {
@@ -33,6 +33,9 @@ public class RoomInfo
 
     /// <summary>游戏版本号。</summary>
     public string Version { get; set; } = "1.0.0";
+
+    /// <summary>广播实例标识，用于过滤自身广播（同一进程内）。</summary>
+    public string InstanceId { get; set; } = "";
 
     /// <summary>自定义元数据字典，使用者可存放任意键值对。</summary>
     public Dictionary<string, string> Metadata { get; set; } = new();
